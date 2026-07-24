@@ -45,6 +45,18 @@ SESSION_END   = dt.time(15, 30)
 
 STATE_DIR = os.environ.get("STATE_DIR", "state")
 
+# Telegram message me event-type grouping — readable headers + order
+EVENT_META = {
+    "ORB▲✓":  ("🟢 ORB Breakout", 0, +1),
+    "ORB▼✓":  ("🔴 ORB Breakdown", 1, -1),
+    "GZ▲✓":   ("🟩 Golden Zone → UP", 2, +1),
+    "GZ▼✓":   ("🟥 Golden Zone → DOWN", 3, -1),
+    "SwL✓":   ("🪤 Low Sweep (bullish trap)", 4, +1),
+    "SwH✓":   ("🪤 High Sweep (bearish trap)", 5, -1),
+    "gSwL✓":  ("💧 GZ Low Sweep (bullish)", 6, +1),
+    "gSwH✓":  ("💧 GZ High Sweep (bearish)", 7, -1),
+}
+
 # ── FULL UNIVERSE: Pine ke B0+B1+B2+B3+B4 ek saath (Python me 40 ki limit nahi) ──
 # Indices: Yahoo ke apne symbols. Jo symbol Yahoo par na mile (data khali aaye),
 # code use chupchaap skip kar deta hai — error nahi aayega.
@@ -293,7 +305,7 @@ def main() -> int:
                        threads=True, progress=False, auto_adjust=False)
 
     state = load_state(day_key)
-    new_lines = []
+    new_items = []
 
     for name, tk in SYMBOLS.items():
         try:
@@ -314,18 +326,27 @@ def main() -> int:
             key = f"{name}|{ev}"
             if key not in state:
                 state[key] = at
-                new_lines.append(f"{name} {ev}@{at}")
+                new_items.append((name, ev, at))
 
-    if new_lines:
-        # sector-wise grouping: IX pehle, phir baaki alphabetically
-        by_sec: dict = {}
-        for line in new_lines:
-            sec = SECTOR_OF.get(line.split(" ")[0], "OT")
-            by_sec.setdefault(sec, []).append(line)
-        order = ["IX"] + sorted(k for k in by_sec if k != "IX")
-        body = "\n".join(f"{sec}: " + " · ".join(by_sec[sec]) for sec in order if sec in by_sec)
-        msg = f"ORB-GZ ✓ [{day_key}] {len(new_lines)} signals\n{body}"
-        print(f"[ALERT] {len(new_lines)} naye confirmed signals:")
+    if new_items:
+        # ── EVENT-TYPE grouping: har section ek emoji header ke saath ──
+        by_ev: dict = {}
+        bulls = bears = 0
+        for name, ev, at in new_items:
+            by_ev.setdefault(ev, []).append((at, name))
+            d = EVENT_META.get(ev, ("", 9, 0))[2]
+            bulls += 1 if d > 0 else 0
+            bears += 1 if d < 0 else 0
+        sections = []
+        for ev in sorted(by_ev, key=lambda e: EVENT_META.get(e, ("", 9, 0))[1]):
+            header, _, _ = EVENT_META.get(ev, (ev, 9, 0))
+            items = sorted(by_ev[ev])  # time ke hisaab se
+            line = " · ".join(f"{nm} @{at}" for at, nm in items)
+            sections.append(f"{header} ({len(items)})\n{line}")
+        head = (f"📊 ORB-GZ ✓ · {ts:%H:%M} · "
+                f"🟢{bulls} 🔴{bears} · {len(new_items)} naye")
+        msg = head + "\n\n" + "\n\n".join(sections)
+        print(f"[ALERT] {len(new_items)} naye confirmed signals:")
         print(msg)
         # Telegram limit 4096 chars — lambi list ko chunks me bhejo
         while msg:
