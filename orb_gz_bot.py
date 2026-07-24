@@ -39,7 +39,7 @@ TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "")
 OR_MINUTES    = int(os.environ.get("OR_MINUTES", "30"))     # 5 / 30 / 60
 FIB1          = 0.500
 FIB2          = 0.618
-SWEEP_MIN_PCT = float(os.environ.get("SWEEP_MIN_PCT", "0.05"))  # % pierce
+SWEEP_MIN_PCT = float(os.environ.get("SWEEP_MIN_PCT", "0.08"))  # % pierce
 SESSION_START = dt.time(9, 15)
 SESSION_END   = dt.time(15, 30)
 
@@ -116,6 +116,11 @@ for _sec, _names in STOCKS_BY_SECTOR.items():
 
 # ────────────────────────── HELPERS ──────────────────────────
 
+# ── REPLAY CUTOFF (testing): --cutoff 10:00 => aisa chalega jaise bot
+#    us waqt run hua ho — sirf us time tak ke candles count honge.
+CUTOFF_TIME = None  # dt.time ya None
+
+
 def now_ist() -> dt.datetime:
     return dt.datetime.now(tz=IST)
 
@@ -126,14 +131,19 @@ def market_open_today(ts: dt.datetime) -> bool:
     return SESSION_START <= ts.time() <= SESSION_END
 
 
-def send_telegram(text: str) -> bool:
+def send_telegram(text: str, html: bool = False) -> bool:
+    """html=True => text me <a>/<b>/<pre> tags allowed (links clickable)."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
         print("[WARN] TELEGRAM_TOKEN / TELEGRAM_CHAT_ID set nahi hai — dry run:")
         print(text)
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT, "text": text,
+               "disable_web_page_preview": True}
+    if html:
+        payload["parse_mode"] = "HTML"
     try:
-        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT, "text": text}, timeout=15)
+        r = requests.post(url, json=payload, timeout=15)
         ok = r.status_code == 200 and r.json().get("ok", False)
         if not ok:
             print(f"[ERROR] Telegram: {r.status_code} {r.text[:200]}")
@@ -141,6 +151,17 @@ def send_telegram(text: str) -> bool:
     except Exception as e:
         print(f"[ERROR] Telegram exception: {e}")
         return False
+
+
+def tv_link(name: str) -> str:
+    """Symbol -> TradingView chart link (tap => chart khul jata hai)."""
+    import html as _html
+    special = {"NIFTY": "NSE:NIFTY", "BANKNIFTY": "NSE:BANKNIFTY",
+               "SENSEX": "BSE:SENSEX", "FINNIFTY": "NSE:FINNIFTY",
+               "MIDCPNIFTY": "NSE:MIDCPNIFTY"}
+    tv = special.get(name, "NSE:" + name.replace("&", "_").replace("-", "_"))
+    url = "https://www.tradingview.com/chart/?symbol=" + tv.replace(":", "%3A")
+    return f'<a href="{url}">{_html.escape(name)}</a>'
 
 
 def load_state(day_key: str) -> dict:
@@ -187,8 +208,13 @@ def analyze_symbol(df: pd.DataFrame) -> dict:
     if df.empty:
         return {}
 
-    # sirf COMPLETED candles: jinka end (start + 5min) ab tak beet chuka ho
-    now = now_ist()
+    # sirf COMPLETED candles: jinka end (start + 5min) ab tak beet chuka ho.
+    # CUTOFF mode me "ab" = data wale din ka cutoff time (replay jaisa).
+    if CUTOFF_TIME is not None:
+        now = df.index[0].replace(hour=CUTOFF_TIME.hour, minute=CUTOFF_TIME.minute,
+                                  second=0, microsecond=0)
+    else:
+        now = now_ist()
     df = df[[ts + dt.timedelta(minutes=5) <= now for ts in df.index]]
     if len(df) < 2:
         return {}
@@ -291,9 +317,23 @@ def analyze_symbol(df: pd.DataFrame) -> dict:
 # ────────────────────────── MAIN ──────────────────────────
 
 def main() -> int:
+    global CUTOFF_TIME
     ts = now_ist()
     day_key = ts.strftime("%Y-%m-%d")
     force = "--force" in sys.argv  # off-hours testing ke liye
+
+    # --cutoff HH:MM => replay mode (sirf us time tak ke signals)
+    if "--cutoff" in sys.argv:
+        try:
+            i = sys.argv.index("--cutoff")
+            hh, mm = sys.argv[i + 1].split(":")
+            CUTOFF_TIME = dt.time(int(hh), int(mm))
+            day_key += f"-cut{hh}{mm}"  # alag state, asli state ganda na ho
+            print(f"[REPLAY] Cutoff {CUTOFF_TIME:%H:%M} — aise chalega jaise "
+                  f"bot us waqt run hua ho.")
+        except (IndexError, ValueError):
+            print("Usage: --cutoff HH:MM (jaise --cutoff 10:00)")
+            return 1
 
     if not force and not market_open_today(ts):
         print(f"[{ts:%H:%M}] Market band hai — exit.")
@@ -301,7 +341,7 @@ def main() -> int:
 
     print(f"[{ts:%H:%M}] {len(SYMBOLS)} symbols fetch ho rahe hain...")
     tickers = list(SYMBOLS.values())
-    data = yf.download(tickers, period="1d", interval="5m", group_by="ticker",
+    data = yf.download(tickers, period="1d", interval="2m", group_by="ticker",
                        threads=True, progress=False, auto_adjust=False)
 
     state = load_state(day_key)
@@ -329,34 +369,54 @@ def main() -> int:
                 new_items.append((name, ev, at))
 
     if new_items:
-        # ── EVENT-TYPE grouping: har section ek emoji header ke saath ──
-        by_ev: dict = {}
+        # ── GROUPED + CLICKABLE: har group ka bold header, symbols par tap
+        #    karte hi TradingView chart khulta hai. Order: ORB Breakdown
+        #    pehle, group ke andar LATEST first.
+        GROUPS = [
+            ("ORB▼✓",  "🔴 ORB Breakdown"),
+            ("ORB▲✓",  "🟢 ORB Breakout"),
+            ("GZ▼✓",   "🟥 Golden Zone DOWN"),
+            ("GZ▲✓",   "🟩 Golden Zone UP"),
+            ("SwH✓",   "🪤 High Sweep (bearish)"),
+            ("SwL✓",   "🪤 Low Sweep (bullish)"),
+            ("gSwH✓",  "💧 GZ High Sweep (bear)"),
+            ("gSwL✓",  "💧 GZ Low Sweep (bull)"),
+        ]
+
+        def t2m(s: str) -> int:
+            h, m = s.split(":")
+            return int(h) * 60 + int(m)
+
         bulls = bears = 0
+        by_ev: dict = {}
         for name, ev, at in new_items:
-            by_ev.setdefault(ev, []).append((at, name))
+            by_ev.setdefault(ev, []).append((name, at))
             d = EVENT_META.get(ev, ("", 9, 0))[2]
             bulls += 1 if d > 0 else 0
             bears += 1 if d < 0 else 0
-        sections = []
-        for ev in sorted(by_ev, key=lambda e: EVENT_META.get(e, ("", 9, 0))[1]):
-            header, _, _ = EVENT_META.get(ev, (ev, 9, 0))
-            items = sorted(by_ev[ev])  # time ke hisaab se
-            line = " · ".join(f"{nm} @{at}" for at, nm in items)
-            sections.append(f"{header} ({len(items)})\n{line}")
-        head = (f"📊 ORB-GZ ✓ · {ts:%H:%M} · "
-                f"🟢{bulls} 🔴{bears} · {len(new_items)} naye")
-        msg = head + "\n\n" + "\n\n".join(sections)
+
+        head = (f"📊 ORB-GZ ✓ · {ts:%H:%M} · 🟢{bulls} 🔴{bears} · "
+                f"{len(new_items)} naye")
+        blocks = []       # HTML blocks (Telegram ke liye)
+        plain_lines = []  # console log ke liye
+        for ev, label in GROUPS:
+            if ev not in by_ev:
+                continue
+            items = sorted(by_ev[ev], key=lambda x: (-t2m(x[1]), x[0]))  # latest first
+            lines = [f"{at}  {tv_link(nm)}" for nm, at in items]
+            blocks.append(f"<b>{label} ({len(items)})</b>\n" + "\n".join(lines))
+            plain_lines.append(f"{label} ({len(items)}): " +
+                               ", ".join(f"{nm}@{at}" for nm, at in items))
         print(f"[ALERT] {len(new_items)} naye confirmed signals:")
-        print(msg)
-        # Telegram limit 4096 chars — lambi list ko chunks me bhejo
-        while msg:
-            if len(msg) <= 3800:
-                send_telegram(msg)
-                break
-            cut = msg.rfind("\n", 0, 3800)
-            cut = cut if cut > 0 else 3800
-            send_telegram(msg[:cut])
-            msg = msg[cut:].lstrip("\n")
+        print(head + "\n" + "\n".join(plain_lines))
+        # 4096-char limit — blocks ko char-budget ke hisaab se chunks me bhejo
+        buf = head
+        for b in blocks:
+            if len(buf) + len(b) + 2 > 3800:
+                send_telegram(buf, html=True)
+                buf = head + " (contd.)"
+            buf += "\n\n" + b
+        send_telegram(buf, html=True)
     else:
         print("Koi naya ✓ confirm nahi.")
 
