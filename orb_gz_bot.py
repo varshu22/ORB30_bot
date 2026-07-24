@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""
+ORB + GOLDEN ZONE — Telegram Alert Bot (Pine v7 logic ka Python port)
+=====================================================================
+Logic bilkul TradingView wale "ORB-GZ N150" indicator jaisa:
+
+  1. OR LOCK ....... 9:15 se OR_MINUTES (default 30) tak ka High/Low lock.
+  2. GOLDEN ZONE ... OR candle bullish (close>=open) ho toh fib 0.5/0.618
+                     HIGH se neeche; bearish ho toh LOW se upar. Din bhar frozen.
+  3. ORB ........... Completed 5-min candle ka CLOSE OR High ke upar => BO,
+                     OR Low ke neeche => BD. Din ka pehla break LOCK (first-signal mode).
+  4. GZ ............ Zone touch => TST; close > gzTop => UP; close < gzBot => DN.
+  5. SWEEPS ........ Wick line ko SWEEP_MIN_PCT se pierce kare, close wapas
+                     andar => OR sweep. GZ sweep strict: close wapas ZONE ke andar.
+  6. ✓ CONFIRM ..... Signal candle ke BAAD wala candle bhi breakout candle ke
+                     close se aage band ho => ✓. ALERT SIRF ✓ PAR JATA HAI.
+  7. DEDUPE ........ state/ me JSON — har (symbol, event) din me sirf ek baar.
+
+Run: har 5 min (GitHub Actions / cron-job.org). Poore din ke 5-min candles
+har run me dobara compute hote hain, isliye missed run se signal nahi chhootta.
+"""
+
+import json
+import os
+import sys
+import datetime as dt
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+import yfinance as yf
+import requests
+
+# ────────────────────────── CONFIG ──────────────────────────
+IST = ZoneInfo("Asia/Kolkata")
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+OR_MINUTES    = int(os.environ.get("OR_MINUTES", "30"))     # 5 / 30 / 60
+FIB1          = 0.500
+FIB2          = 0.618
+SWEEP_MIN_PCT = float(os.environ.get("SWEEP_MIN_PCT", "0.05"))  # % pierce
+SESSION_START = dt.time(9, 15)
+SESSION_END   = dt.time(15, 30)
+
+STATE_DIR = os.environ.get("STATE_DIR", "state")
+
+# yfinance tickers: NSE stock => "RELIANCE.NS". Indices ke apne symbols.
+# Batch 0 (indices + heavyweights) — apni marzi se badal lijiye.
+SYMBOLS = {
+    "NIFTY":      "^NSEI",
+    "BANKNIFTY":  "^NSEBANK",
+    "SENSEX":     "^BSESN",
+    "RELIANCE":   "RELIANCE.NS",
+    "HDFCBANK":   "HDFCBANK.NS",
+    "ICICIBANK":  "ICICIBANK.NS",
+    "INFY":       "INFY.NS",
+    "TCS":        "TCS.NS",
+    "ITC":        "ITC.NS",
+    "LT":         "LT.NS",
+    "AXISBANK":   "AXISBANK.NS",
+    "KOTAKBANK":  "KOTAKBANK.NS",
+    "SBIN":       "SBIN.NS",
+    "BHARTIARTL": "BHARTIARTL.NS",
+    "MARUTI":     "MARUTI.NS",
+    "SUNPHARMA":  "SUNPHARMA.NS",
+    "BAJFINANCE": "BAJFINANCE.NS",
+    "HCLTECH":    "HCLTECH.NS",
+    "NTPC":       "NTPC.NS",
+    "TATASTEEL":  "TATASTEEL.NS",
+    "ADANIENT":   "ADANIENT.NS",
+    "ONGC":       "ONGC.NS",
+    "HINDUNILVR": "HINDUNILVR.NS",
+    "TITAN":      "TITAN.NS",
+    "ULTRACEMCO": "ULTRACEMCO.NS",
+    "M&M":        "M&M.NS",
+    "POWERGRID":  "POWERGRID.NS",
+    "COALINDIA":  "COALINDIA.NS",
+}
+
+# ────────────────────────── HELPERS ──────────────────────────
+
+def now_ist() -> dt.datetime:
+    return dt.datetime.now(tz=IST)
+
+
+def market_open_today(ts: dt.datetime) -> bool:
+    if ts.weekday() >= 5:  # Sat/Sun
+        return False
+    return SESSION_START <= ts.time() <= SESSION_END
+
+
+def send_telegram(text: str) -> bool:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
+        print("[WARN] TELEGRAM_TOKEN / TELEGRAM_CHAT_ID set nahi hai — dry run:")
+        print(text)
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT, "text": text}, timeout=15)
+        ok = r.status_code == 200 and r.json().get("ok", False)
+        if not ok:
+            print(f"[ERROR] Telegram: {r.status_code} {r.text[:200]}")
+        return ok
+    except Exception as e:
+        print(f"[ERROR] Telegram exception: {e}")
+        return False
+
+
+def load_state(day_key: str) -> dict:
+    path = os.path.join(STATE_DIR, f"alerted_{day_key}.json")
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_state(day_key: str, state: dict) -> None:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    path = os.path.join(STATE_DIR, f"alerted_{day_key}.json")
+    with open(path, "w") as f:
+        json.dump(state, f, indent=1, sort_keys=True)
+    # Purane din ki files साफ (7 din se purani)
+    cutoff = (now_ist() - dt.timedelta(days=7)).strftime("%Y-%m-%d")
+    for fn in os.listdir(STATE_DIR):
+        if fn.startswith("alerted_") and fn.endswith(".json"):
+            d = fn[len("alerted_"):-len(".json")]
+            if d < cutoff:
+                try:
+                    os.remove(os.path.join(STATE_DIR, fn))
+                except OSError:
+                    pass
+
+
+# ────────────────────── CORE: PINE LOGIC PORT ──────────────────────
+
+def analyze_symbol(df: pd.DataFrame) -> dict:
+    """Ek symbol ke aaj ke 5-min candles => confirmed events.
+
+    Pine ke scanner (f_scan) jaisa: signals COMPLETED candle par, first-signal
+    lock, ✓ confirm agle candle ke close se (confRef = breakout candle close).
+    Return: {"ORB_UP✓": "9:50", "SWH✓": "10:15", ...} sirf CONFIRMED events.
+    """
+    if df is None or df.empty or len(df) < 3:
+        return {}
+
+    df = df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
+    if df.empty:
+        return {}
+
+    # sirf COMPLETED candles: jinka end (start + 5min) ab tak beet chuka ho
+    now = now_ist()
+    df = df[[ts + dt.timedelta(minutes=5) <= now for ts in df.index]]
+    if len(df) < 2:
+        return {}
+
+    day0 = df.index[0]
+    or_end = day0.replace(hour=SESSION_START.hour, minute=SESSION_START.minute,
+                          second=0, microsecond=0) + dt.timedelta(minutes=OR_MINUTES)
+
+    or_df = df[df.index < or_end]
+    post  = df[df.index >= or_end]
+    if or_df.empty or len(post) < 1:
+        return {}
+
+    # ── OR LOCK ──
+    rO = float(or_df["Open"].iloc[0])
+    rC = float(or_df["Close"].iloc[-1])
+    kH = float(or_df["High"].max())
+    kL = float(or_df["Low"].min())
+
+    # ── GOLDEN ZONE (anchor High/Low, direction from OR candle body) ──
+    bl = rC >= rO
+    rg = kH - kL
+    x1 = (kH - rg * FIB1) if bl else (kL + rg * FIB1)
+    x2 = (kH - rg * FIB2) if bl else (kL + rg * FIB2)
+    gzT, gzB = max(x1, x2), min(x1, x2)
+
+    pcH = kH * SWEEP_MIN_PCT / 100
+    pcL = kL * SWEEP_MIN_PCT / 100
+    pcT = gzT * SWEEP_MIN_PCT / 100
+    pcB = gzB * SWEEP_MIN_PCT / 100
+
+    # ── STATE MACHINES (first-signal lock, Pine jaisa) ──
+    orb_st = 0   # 1 BO / -1 BD
+    gz_st  = 0   # 2 UP / -2 DN / 3 TST
+    sw_st  = 0   # 1 high swept / -1 low swept
+    gw_st  = 0   # 1 gz-top swept / -1 gz-bottom swept
+    orb = {"ref": None, "i": None, "cf": 0, "t": None}
+    gz  = {"ref": None, "i": None, "cf": 0, "t": None}
+    sw  = {"i": None, "cf": 0, "t": None}
+    gw  = {"i": None, "cf": 0, "t": None}
+
+    rows = list(post.itertuples())
+    for i, r in enumerate(rows):
+        pH, pL, pC = float(r.High), float(r.Low), float(r.Close)
+        tstr = r.Index.strftime("%H:%M")
+
+        # ── pehle pending confirms settle karo (agla candle = ye wala) ──
+        if orb["i"] is not None and i == orb["i"] + 1 and orb["cf"] == 0:
+            orb["cf"] = 1 if (pC > orb["ref"] if orb_st == 1 else pC < orb["ref"]) else -1
+        if gz["i"] is not None and i == gz["i"] + 1 and gz["cf"] == 0:
+            gz["cf"] = 1 if (pC > gz["ref"] if gz_st == 2 else pC < gz["ref"]) else -1
+        if sw["i"] is not None and i == sw["i"] + 1 and sw["cf"] == 0:
+            sw["cf"] = 1 if (pC < kH if sw_st == 1 else pC > kL) else -1
+        if gw["i"] is not None and i == gw["i"] + 1 and gw["cf"] == 0:
+            gw["cf"] = 1 if (pC < gzT if gw_st == 1 else pC > gzB) else -1
+
+        # ── ORB (first signal locks) ──
+        if orb_st == 0:
+            if pC > kH:
+                orb_st, orb = 1, {"ref": pC, "i": i, "cf": 0, "t": tstr}
+            elif pC < kL:
+                orb_st, orb = -1, {"ref": pC, "i": i, "cf": 0, "t": tstr}
+
+        # ── GOLDEN ZONE ──
+        if gz_st == 0 and pL <= gzT and pH >= gzB:
+            gz_st = 3  # tested
+        if gz_st in (3,):  # touch ke baad hi break count hota hai (Pine same)
+            if pC > gzT:
+                gz_st, gz = 2, {"ref": pC, "i": i, "cf": 0, "t": tstr}
+            elif pC < gzB:
+                gz_st, gz = -2, {"ref": pC, "i": i, "cf": 0, "t": tstr}
+
+        # ── OR SWEEP (wick pierce + close back) ──
+        if sw_st == 0:
+            if pH > kH + pcH and pC < kH:
+                sw_st, sw = 1, {"i": i, "cf": 0, "t": tstr}
+            elif pL < kL - pcL and pC > kL:
+                sw_st, sw = -1, {"i": i, "cf": 0, "t": tstr}
+
+        # ── GZ SWEEP (strict: close wapas zone ke ANDAR) ──
+        if gw_st == 0:
+            if pH > gzT + pcT and pC < gzT and pC > gzB:
+                gw_st, gw = 1, {"i": i, "cf": 0, "t": tstr}
+            elif pL < gzB - pcB and pC > gzB and pC < gzT:
+                gw_st, gw = -1, {"i": i, "cf": 0, "t": tstr}
+
+    # ── sirf ✓ CONFIRMED events return karo ──
+    ev = {}
+    if orb_st != 0 and orb["cf"] == 1:
+        ev["ORB▲✓" if orb_st == 1 else "ORB▼✓"] = orb["t"]
+    if gz_st in (2, -2) and gz["cf"] == 1:
+        ev["GZ▲✓" if gz_st == 2 else "GZ▼✓"] = gz["t"]
+    if sw_st != 0 and sw["cf"] == 1:
+        ev["SwH✓" if sw_st == 1 else "SwL✓"] = sw["t"]
+    if gw_st != 0 and gw["cf"] == 1:
+        ev["gSwH✓" if gw_st == 1 else "gSwL✓"] = gw["t"]
+    return ev
+
+
+# ────────────────────────── MAIN ──────────────────────────
+
+def main() -> int:
+    ts = now_ist()
+    day_key = ts.strftime("%Y-%m-%d")
+    force = "--force" in sys.argv  # off-hours testing ke liye
+
+    if not force and not market_open_today(ts):
+        print(f"[{ts:%H:%M}] Market band hai — exit.")
+        return 0
+
+    print(f"[{ts:%H:%M}] {len(SYMBOLS)} symbols fetch ho rahe hain...")
+    tickers = list(SYMBOLS.values())
+    data = yf.download(tickers, period="1d", interval="5m", group_by="ticker",
+                       threads=True, progress=False, auto_adjust=False)
+
+    state = load_state(day_key)
+    new_lines = []
+
+    for name, tk in SYMBOLS.items():
+        try:
+            df = data[tk] if len(tickers) > 1 else data
+            if df is None or df.empty:
+                continue
+            df = df.copy()
+            # yfinance index UTC/exchange-tz ho sakta hai => IST me lao
+            if df.index.tz is None:
+                df.index = df.index.tz_localize("UTC")
+            df.index = df.index.tz_convert(IST)
+            events = analyze_symbol(df)
+        except Exception as e:
+            print(f"[WARN] {name}: {e}")
+            continue
+
+        for ev, at in events.items():
+            key = f"{name}|{ev}"
+            if key not in state:
+                state[key] = at
+                new_lines.append(f"{name} {ev}@{at}")
+
+    if new_lines:
+        msg = f"ORB-GZ ✓ [{day_key}]\n" + "\n".join(new_lines)
+        print(f"[ALERT] {len(new_lines)} naye confirmed signals:")
+        print(msg)
+        send_telegram(msg)
+    else:
+        print("Koi naya ✓ confirm nahi.")
+
+    save_state(day_key, state)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
