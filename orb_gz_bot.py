@@ -45,38 +45,62 @@ SESSION_END   = dt.time(15, 30)
 
 STATE_DIR = os.environ.get("STATE_DIR", "state")
 
-# yfinance tickers: NSE stock => "RELIANCE.NS". Indices ke apne symbols.
-# Batch 0 (indices + heavyweights) — apni marzi se badal lijiye.
-SYMBOLS = {
+# ── FULL UNIVERSE: Pine ke B0+B1+B2+B3+B4 ek saath (Python me 40 ki limit nahi) ──
+# Indices: Yahoo ke apne symbols. Jo symbol Yahoo par na mile (data khali aaye),
+# code use chupchaap skip kar deta hai — error nahi aayega.
+INDICES = {
     "NIFTY":      "^NSEI",
     "BANKNIFTY":  "^NSEBANK",
     "SENSEX":     "^BSESN",
-    "RELIANCE":   "RELIANCE.NS",
-    "HDFCBANK":   "HDFCBANK.NS",
-    "ICICIBANK":  "ICICIBANK.NS",
-    "INFY":       "INFY.NS",
-    "TCS":        "TCS.NS",
-    "ITC":        "ITC.NS",
-    "LT":         "LT.NS",
-    "AXISBANK":   "AXISBANK.NS",
-    "KOTAKBANK":  "KOTAKBANK.NS",
-    "SBIN":       "SBIN.NS",
-    "BHARTIARTL": "BHARTIARTL.NS",
-    "MARUTI":     "MARUTI.NS",
-    "SUNPHARMA":  "SUNPHARMA.NS",
-    "BAJFINANCE": "BAJFINANCE.NS",
-    "HCLTECH":    "HCLTECH.NS",
-    "NTPC":       "NTPC.NS",
-    "TATASTEEL":  "TATASTEEL.NS",
-    "ADANIENT":   "ADANIENT.NS",
-    "ONGC":       "ONGC.NS",
-    "HINDUNILVR": "HINDUNILVR.NS",
-    "TITAN":      "TITAN.NS",
-    "ULTRACEMCO": "ULTRACEMCO.NS",
-    "M&M":        "M&M.NS",
-    "POWERGRID":  "POWERGRID.NS",
-    "COALINDIA":  "COALINDIA.NS",
+    "FINNIFTY":   "NIFTY_FIN_SERVICE.NS",
+    "MIDCPNIFTY": "NIFTY_MID_SELECT.NS",
 }
+
+# NSE stocks — Yahoo ticker = naam + ".NS" (M&M.NS, BAJAJ-AUTO.NS bhi aise hi).
+STOCKS_BY_SECTOR = {
+    "BK": ["HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK", "INDUSINDBK",
+           "CANBK", "BANKBARODA", "PNB", "UNIONBANK", "IDFCFIRSTB", "FEDERALBNK",
+           "AUBANK", "BANDHANBNK"],
+    "FN": ["BAJFINANCE", "BAJAJFINSV", "JIOFIN", "SHRIRAMFIN", "CHOLAFIN",
+           "BAJAJHLDNG", "MUTHOOTFIN", "LICHSGFIN", "PFC", "RECLTD", "IRFC",
+           "HUDCO", "HDFCAMC", "SBICARD"],
+    "IN": ["HDFCLIFE", "SBILIFE", "ICICIGI", "ICICIPRULI", "LICI"],
+    "IT": ["INFY", "TCS", "HCLTECH", "WIPRO", "TECHM", "LTIM"],
+    "NT": ["PAYTM", "POLICYBZR", "NAUKRI", "ETERNAL", "IRCTC"],
+    "AU": ["MARUTI", "M&M", "TMPV", "EICHERMOT", "HEROMOTOCO", "BAJAJ-AUTO",
+           "ASHOKLEY", "TVSMOTOR", "BHARATFORG", "MOTHERSON", "BOSCHLTD", "MRF",
+           "BALKRISIND", "APOLLOTYRE", "EXIDEIND", "TIINDIA", "ESCORTS"],
+    "PH": ["SUNPHARMA", "DRREDDY", "CIPLA", "DIVISLAB", "ZYDUSLIFE", "LUPIN",
+           "AUROPHARMA", "TORNTPHARM", "ALKEM", "BIOCON", "GLENMARK"],
+    "HC": ["APOLLOHOSP", "MAXHEALTH", "FORTIS", "LALPATHLAB"],
+    "FM": ["ITC", "HINDUNILVR", "NESTLEIND", "BRITANNIA", "TATACONSUM",
+           "GODREJCP", "DABUR", "MARICO", "COLPAL", "VBL", "UNITDSPR", "UBL"],
+    "RT": ["TRENT", "DMART", "PAGEIND", "BATAINDIA", "JUBLFOOD"],
+    "MT": ["TATASTEEL", "JSWSTEEL", "HINDALCO"],
+    "EN": ["RELIANCE", "ONGC", "COALINDIA", "BPCL", "GAIL", "PETRONET", "IGL",
+           "HINDPETRO", "IOC"],
+    "PW": ["NTPC", "POWERGRID", "TATAPOWER", "ADANIGREEN", "ADANIENSOL",
+           "ADANIPOWER", "NHPC", "SJVN", "TORNTPOWER"],
+    "CM": ["ULTRACEMCO", "GRASIM", "AMBUJACEM", "ACC", "SHREECEM"],
+    "RE": ["DLF", "LODHA", "GODREJPROP", "OBEROIRLTY"],
+    "CG": ["LT", "BEL", "SIEMENS", "ABB", "CUMMINSIND", "POLYCAB", "KEI",
+           "ADANIENT"],
+    "CH": ["PIDILITIND", "ASTRAL", "SUPREMEIND", "SRF", "PIIND", "UPL",
+           "COROMANDEL", "TATACHEM", "DEEPAKNTR"],
+    "CD": ["TITAN", "ASIANPAINT", "BERGEPAINT", "HAVELLS", "DIXON", "VOLTAS",
+           "BLUESTARCO", "CROMPTON"],
+    "TL": ["BHARTIARTL"],
+    "TR": ["ADANIPORTS", "CONCOR", "INDIGO"],
+}
+
+# name -> yf ticker, aur name -> sector (message grouping ke liye)
+SYMBOLS = dict(INDICES)
+SECTOR_OF = {n: "IX" for n in INDICES}
+for _sec, _names in STOCKS_BY_SECTOR.items():
+    for _n in _names:
+        if _n not in SYMBOLS:  # duplicates auto-dedupe
+            SYMBOLS[_n] = _n + ".NS"
+            SECTOR_OF[_n] = _sec
 
 # ────────────────────────── HELPERS ──────────────────────────
 
@@ -293,10 +317,25 @@ def main() -> int:
                 new_lines.append(f"{name} {ev}@{at}")
 
     if new_lines:
-        msg = f"ORB-GZ ✓ [{day_key}]\n" + "\n".join(new_lines)
+        # sector-wise grouping: IX pehle, phir baaki alphabetically
+        by_sec: dict = {}
+        for line in new_lines:
+            sec = SECTOR_OF.get(line.split(" ")[0], "OT")
+            by_sec.setdefault(sec, []).append(line)
+        order = ["IX"] + sorted(k for k in by_sec if k != "IX")
+        body = "\n".join(f"{sec}: " + " · ".join(by_sec[sec]) for sec in order if sec in by_sec)
+        msg = f"ORB-GZ ✓ [{day_key}] {len(new_lines)} signals\n{body}"
         print(f"[ALERT] {len(new_lines)} naye confirmed signals:")
         print(msg)
-        send_telegram(msg)
+        # Telegram limit 4096 chars — lambi list ko chunks me bhejo
+        while msg:
+            if len(msg) <= 3800:
+                send_telegram(msg)
+                break
+            cut = msg.rfind("\n", 0, 3800)
+            cut = cut if cut > 0 else 3800
+            send_telegram(msg[:cut])
+            msg = msg[cut:].lstrip("\n")
     else:
         print("Koi naya ✓ confirm nahi.")
 
