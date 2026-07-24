@@ -1,0 +1,45 @@
+name: ORB-GZ Telegram Alerts
+
+on:
+  schedule:
+    # IST 9:15-15:30 = UTC 3:45-10:00 (Mon-Fri). Actions cron me 5-15 min
+    # ka delay normal hai — cron-job.org se workflow_dispatch hit karna
+    # zyada punctual hai (neeche note dekhiye).
+    - cron: "*/5 3-10 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: orb-gz
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Run ORB-GZ scan
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python orb_gz_bot.py
+
+      - name: Commit dedupe state
+        run: |
+          git config user.name "orb-gz-bot"
+          git config user.email "actions@github.com"
+          git add state/ || true
+          git diff --cached --quiet || git commit -m "state: $(date -u +'%Y-%m-%d %H:%M') [skip ci]"
+          git pull --rebase --autostash || true
+          git push || true
