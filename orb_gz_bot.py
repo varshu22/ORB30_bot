@@ -37,9 +37,12 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 OR_MINUTES    = int(os.environ.get("OR_MINUTES", "30"))     # 5 / 30 / 60
+SCAN_TF_MIN   = int(os.environ.get("SCAN_TF_MIN", "2"))     # candle TF minutes (Pine: Scan TF)
 FIB1          = 0.500
 FIB2          = 0.618
-SWEEP_MIN_PCT = float(os.environ.get("SWEEP_MIN_PCT", "0.08"))  # % pierce
+SWEEP_MIN_PCT = float(os.environ.get("SWEEP_MIN_PCT", "0.05"))  # % pierce
+TRAP_CONF_N   = int(os.environ.get("TRAP_CONF_N", "2"))     # Pine: TRAP N candles held
+RE_ARM        = os.environ.get("RE_ARM", "1") == "1"        # Pine: reArmOrb + reArmGz ON
 SESSION_START = dt.time(9, 15)
 SESSION_END   = dt.time(15, 30)
 
@@ -55,6 +58,8 @@ EVENT_META = {
     "SwH✓":   ("🪤 High Sweep (bearish trap)", 5, -1),
     "gSwL✓":  ("💧 GZ Low Sweep (bullish)", 6, +1),
     "gSwH✓":  ("💧 GZ High Sweep (bearish)", 7, -1),
+    "TRAP▲":  ("🔄 Bullish Trap (failed breakdown)", 8, +1),
+    "TRAP▼":  ("🔄 Bearish Trap (failed breakout)", 9, -1),
 }
 
 # ── FULL UNIVERSE: Pine ke B0+B1+B2+B3+B4 ek saath (Python me 40 ki limit nahi) ──
@@ -215,7 +220,7 @@ def analyze_symbol(df: pd.DataFrame) -> dict:
                                   second=0, microsecond=0)
     else:
         now = now_ist()
-    df = df[[ts + dt.timedelta(minutes=5) <= now for ts in df.index]]
+    df = df[[ts + dt.timedelta(minutes=SCAN_TF_MIN) <= now for ts in df.index]]
     if len(df) < 2:
         return {}
 
@@ -255,6 +260,15 @@ def analyze_symbol(df: pd.DataFrame) -> dict:
     gz  = {"ref": None, "i": None, "cf": 0, "t": None}
     sw  = {"i": None, "cf": 0, "t": None}
     gw  = {"i": None, "cf": 0, "t": None}
+    orb_armed = False  # reArmOrb: range me wapas close => agla break naya event
+    gz_armed  = False  # reArmGz: zone me wapas close => agla GZ break naya event
+    # TRAP (Pine grpSm): failed-break reversal — break ke baad OR level ka
+    # reclaim jo TRAP_CONF_N lagataar candles tak HELD rahe.
+    last_break = 0    # -1 = last close OR Low ke neeche tha, +1 = OR High ke upar
+    above_cnt = 0     # down-break ke baad lagataar closes OR Low ke UPAR
+    below_cnt = 0     # up-break ke baad lagataar closes OR High ke NEECHE
+    trap_up_t = None  # pehla confirmed bullish trap (T▲) ka time
+    trap_dn_t = None  # pehla confirmed bearish trap (T▼) ka time
 
     rows = list(post.itertuples())
     for i, r in enumerate(rows):
@@ -271,21 +285,30 @@ def analyze_symbol(df: pd.DataFrame) -> dict:
         if gw["i"] is not None and i == gw["i"] + 1 and gw["cf"] == 0:
             gw["cf"] = 1 if (pC < gzT if gw_st == 1 else pC > gzB) else -1
 
-        # ── ORB (first signal locks) ──
-        if orb_st == 0:
-            if pC > kH:
-                orb_st, orb = 1, {"ref": pC, "i": i, "cf": 0, "t": tstr}
-            elif pC < kL:
-                orb_st, orb = -1, {"ref": pC, "i": i, "cf": 0, "t": tstr}
+        # ── ORB (re-arm ON: range me wapas close => agla break NAYA event) ──
+        if RE_ARM and orb_st != 0 and kL <= pC <= kH:
+            orb_armed = True
+        orb_locked = orb_st != 0 and not orb_armed
+        if pC > kH and (orb_st != 1 or orb_armed) and not orb_locked:
+            orb_st, orb = 1, {"ref": pC, "i": i, "cf": 0, "t": tstr}
+            orb_armed = False
+        elif pC < kL and (orb_st != -1 or orb_armed) and not orb_locked:
+            orb_st, orb = -1, {"ref": pC, "i": i, "cf": 0, "t": tstr}
+            orb_armed = False
 
-        # ── GOLDEN ZONE ──
+        # ── GOLDEN ZONE (re-arm ON: zone me wapas close => agla break NAYA) ──
         if gz_st == 0 and pL <= gzT and pH >= gzB:
-            gz_st = 3  # tested
-        if gz_st in (3,):  # touch ke baad hi break count hota hai (Pine same)
-            if pC > gzT:
+            gz_st = 3  # tested — touch ke baad hi break count hota hai (Pine same)
+        if RE_ARM and gz_st in (2, -2) and gzB <= pC <= gzT:
+            gz_armed = True
+        gz_locked = gz_st in (2, -2) and not gz_armed
+        if gz_st != 0 and not gz_locked:
+            if pC > gzT and (gz_st != 2 or gz_armed):
                 gz_st, gz = 2, {"ref": pC, "i": i, "cf": 0, "t": tstr}
-            elif pC < gzB:
+                gz_armed = False
+            elif pC < gzB and (gz_st != -2 or gz_armed):
                 gz_st, gz = -2, {"ref": pC, "i": i, "cf": 0, "t": tstr}
+                gz_armed = False
 
         # ── OR SWEEP (wick pierce + close back) ──
         if sw_st == 0:
@@ -301,6 +324,18 @@ def analyze_symbol(df: pd.DataFrame) -> dict:
             elif pL < gzB - pcB and pC > gzB and pC < gzT:
                 gw_st, gw = -1, {"i": i, "cf": 0, "t": tstr}
 
+        # ── TRAP (Pine same order): pehle lastBreak update, phir counts ──
+        if pC < kL:
+            last_break = -1
+        elif pC > kH:
+            last_break = 1
+        above_cnt = above_cnt + 1 if (last_break == -1 and pC > kL) else 0
+        below_cnt = below_cnt + 1 if (last_break == 1 and pC < kH) else 0
+        if above_cnt == TRAP_CONF_N and trap_up_t is None:
+            trap_up_t = tstr   # bullish trap: breakdown fail + reclaim held
+        if below_cnt == TRAP_CONF_N and trap_dn_t is None:
+            trap_dn_t = tstr   # bearish trap: breakout fail + reject held
+
     # ── sirf ✓ CONFIRMED events return karo ──
     ev = {}
     if orb_st != 0 and orb["cf"] == 1:
@@ -311,6 +346,11 @@ def analyze_symbol(df: pd.DataFrame) -> dict:
         ev["SwH✓" if sw_st == 1 else "SwL✓"] = sw["t"]
     if gw_st != 0 and gw["cf"] == 1:
         ev["gSwH✓" if gw_st == 1 else "gSwL✓"] = gw["t"]
+    # TRAP: N-candle hold khud hi confirmation hai, isliye alag ✓ nahi chahiye
+    if trap_up_t is not None:
+        ev["TRAP▲"] = trap_up_t
+    if trap_dn_t is not None:
+        ev["TRAP▼"] = trap_dn_t
     return ev
 
 
@@ -341,7 +381,8 @@ def main() -> int:
 
     print(f"[{ts:%H:%M}] {len(SYMBOLS)} symbols fetch ho rahe hain...")
     tickers = list(SYMBOLS.values())
-    data = yf.download(tickers, period="1d", interval="2m", group_by="ticker",
+    data = yf.download(tickers, period="1d", interval=f"{SCAN_TF_MIN}m",
+                       group_by="ticker",
                        threads=True, progress=False, auto_adjust=False)
 
     state = load_state(day_key)
@@ -363,7 +404,8 @@ def main() -> int:
             continue
 
         for ev, at in events.items():
-            key = f"{name}|{ev}"
+            # time bhi key me — re-armed naya break (naye time par) dobara alert kare
+            key = f"{name}|{ev}|{at}"
             if key not in state:
                 state[key] = at
                 new_items.append((name, ev, at))
@@ -377,6 +419,8 @@ def main() -> int:
             ("ORB▲✓",  "🟢 ORB Breakout"),
             ("GZ▼✓",   "🟥 Golden Zone DOWN"),
             ("GZ▲✓",   "🟩 Golden Zone UP"),
+            ("TRAP▼",  "🔄 Bearish Trap (failed breakout)"),
+            ("TRAP▲",  "🔄 Bullish Trap (failed breakdown)"),
             ("SwH✓",   "🪤 High Sweep (bearish)"),
             ("SwL✓",   "🪤 Low Sweep (bullish)"),
             ("gSwH✓",  "💧 GZ High Sweep (bear)"),
