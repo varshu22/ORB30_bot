@@ -69,8 +69,8 @@ INDICES = {
     "NIFTY":      "^NSEI",
     "BANKNIFTY":  "^NSEBANK",
     "SENSEX":     "^BSESN",
-    "FINNIFTY":   "NIFTY_FIN_SERVICE.NS",
-    "MIDCPNIFTY": "NIFTY_MID_SELECT.NS",
+    # "FINNIFTY":   "NIFTY_FIN_SERVICE.NS",
+    # "MIDCPNIFTY": "NIFTY_MID_SELECT.NS",
 }
 
 # NSE stocks — Yahoo ticker = naam + ".NS" (M&M.NS, BAJAJ-AUTO.NS bhi aise hi).
