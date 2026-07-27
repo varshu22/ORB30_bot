@@ -40,7 +40,7 @@ OR_MINUTES    = int(os.environ.get("OR_MINUTES", "30"))     # 5 / 30 / 60
 SCAN_TF_MIN   = int(os.environ.get("SCAN_TF_MIN", "2"))     # candle TF minutes (Pine: Scan TF)
 FIB1          = 0.500
 FIB2          = 0.618
-SWEEP_MIN_PCT = float(os.environ.get("SWEEP_MIN_PCT", "0.05"))  # % pierce
+SWEEP_MIN_PCT = float(os.environ.get("SWEEP_MIN_PCT", "0.02"))  # % pierce
 TRAP_CONF_N   = int(os.environ.get("TRAP_CONF_N", "2"))     # Pine: TRAP N candles held
 RE_ARM        = os.environ.get("RE_ARM", "1") == "1"        # re-arm: ORB + GZ + SWEEPS + TRAP
 SESSION_START = dt.time(9, 15)
