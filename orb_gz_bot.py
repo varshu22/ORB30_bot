@@ -74,6 +74,7 @@ INDICES = {
 }
 
 # NSE stocks — Yahoo ticker = naam + ".NS" (M&M.NS, BAJAJ-AUTO.NS bhi aise hi).
+STOCKS_BY_SECTOR = {}
 # STOCKS_BY_SECTOR = {
 #     "BK": ["HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK", "INDUSINDBK",
 #            "CANBK", "BANKBARODA", "PNB", "UNIONBANK", "IDFCFIRSTB", "FEDERALBNK",
