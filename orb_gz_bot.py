@@ -42,7 +42,7 @@ FIB1          = 0.500
 FIB2          = 0.618
 SWEEP_MIN_PCT = float(os.environ.get("SWEEP_MIN_PCT", "0.05"))  # % pierce
 TRAP_CONF_N   = int(os.environ.get("TRAP_CONF_N", "2"))     # Pine: TRAP N candles held
-RE_ARM        = os.environ.get("RE_ARM", "1") == "1"        # Pine: reArmOrb + reArmGz ON
+RE_ARM        = os.environ.get("RE_ARM", "1") == "1"        # re-arm: ORB + GZ + SWEEPS + TRAP
 SESSION_START = dt.time(9, 15)
 SESSION_END   = dt.time(15, 30)
 
@@ -201,11 +201,11 @@ def save_state(day_key: str, state: dict) -> None:
 # ────────────────────── CORE: PINE LOGIC PORT ──────────────────────
 
 def analyze_symbol(df: pd.DataFrame) -> dict:
-    """Ek symbol ke aaj ke 5-min candles => confirmed events.
+    """Ek symbol ke aaj ke candles => confirmed events (latest per event type).
 
-    Pine ke scanner (f_scan) jaisa: signals COMPLETED candle par, first-signal
-    lock, ✓ confirm agle candle ke close se (confRef = breakout candle close).
-    Return: {"ORB_UP✓": "9:50", "SWH✓": "10:15", ...} sirf CONFIRMED events.
+    Pine ke scanner (f_scan) jaisa: signals COMPLETED candle par, re-arm ON,
+    ✓ confirm agle candle ke close se (confRef = breakout candle close).
+    Return: {"ORB▲✓": "9:50", "SwH✓": "10:15", ...} sirf CONFIRMED events.
     """
     if df is None or df.empty or len(df) < 3:
         return {}
@@ -214,7 +214,7 @@ def analyze_symbol(df: pd.DataFrame) -> dict:
     if df.empty:
         return {}
 
-    # sirf COMPLETED candles: jinka end (start + 5min) ab tak beet chuka ho.
+    # sirf COMPLETED candles: jinka end (start + TF) ab tak beet chuka ho.
     # CUTOFF mode me "ab" = data wale din ka cutoff time (replay jaisa).
     if CUTOFF_TIME is not None:
         now = df.index[0].replace(hour=CUTOFF_TIME.hour, minute=CUTOFF_TIME.minute,
@@ -252,24 +252,30 @@ def analyze_symbol(df: pd.DataFrame) -> dict:
     pcT = gzT * SWEEP_MIN_PCT / 100
     pcB = gzB * SWEEP_MIN_PCT / 100
 
-    # ── STATE MACHINES (first-signal lock, Pine jaisa) ──
+    # ── STATE MACHINES (re-arm sab par: ORB · GZ · SWEEPS · TRAP) ──
     orb_st = 0   # 1 BO / -1 BD
     gz_st  = 0   # 2 UP / -2 DN / 3 TST
-    sw_st  = 0   # 1 high swept / -1 low swept
-    gw_st  = 0   # 1 gz-top swept / -1 gz-bottom swept
+    sw_st  = 0   # 1 high swept / -1 low swept (latest)
+    gw_st  = 0   # 1 gz-top swept / -1 gz-bottom swept (latest)
     orb = {"ref": None, "i": None, "cf": 0, "t": None}
     gz  = {"ref": None, "i": None, "cf": 0, "t": None}
     sw  = {"i": None, "cf": 0, "t": None}
     gw  = {"i": None, "cf": 0, "t": None}
     orb_armed = False  # reArmOrb: range me wapas close => agla break naya event
     gz_armed  = False  # reArmGz: zone me wapas close => agla GZ break naya event
+    # SWEEP RE-ARM: fire hone ke baad jaise hi condition ek candle FALSE ho,
+    # wo direction phir se armed — ek hi lambi wick lagataar spam nahi karegi.
+    swH_armed = True
+    swL_armed = True
+    gwH_armed = True
+    gwL_armed = True
     # TRAP (Pine grpSm): failed-break reversal — break ke baad OR level ka
     # reclaim jo TRAP_CONF_N lagataar candles tak HELD rahe.
     last_break = 0    # -1 = last close OR Low ke neeche tha, +1 = OR High ke upar
     above_cnt = 0     # down-break ke baad lagataar closes OR Low ke UPAR
     below_cnt = 0     # up-break ke baad lagataar closes OR High ke NEECHE
-    trap_up_t = None  # pehla confirmed bullish trap (T▲) ka time
-    trap_dn_t = None  # pehla confirmed bearish trap (T▼) ka time
+    trap_up_t = None  # latest confirmed bullish trap (T▲) ka time
+    trap_dn_t = None  # latest confirmed bearish trap (T▼) ka time
 
     rows = list(post.itertuples())
     for i, r in enumerate(rows):
@@ -311,30 +317,44 @@ def analyze_symbol(df: pd.DataFrame) -> dict:
                 gz_st, gz = -2, {"ref": pC, "i": i, "cf": 0, "t": tstr}
                 gz_armed = False
 
-        # ── OR SWEEP (wick pierce + close back) ──
-        if sw_st == 0:
-            if pH > kH + pcH and pC < kH:
-                sw_st, sw = 1, {"i": i, "cf": 0, "t": tstr}
-            elif pL < kL - pcL and pC > kL:
-                sw_st, sw = -1, {"i": i, "cf": 0, "t": tstr}
+        # ── OR SWEEP (RE-ARM: condition ek candle FALSE ho jaye => phir armed) ──
+        condH = pH > kH + pcH and pC < kH
+        condL = pL < kL - pcL and pC > kL
+        if condH and swH_armed:
+            sw_st, sw = 1, {"i": i, "cf": 0, "t": tstr}
+            swH_armed = False
+        elif not condH and RE_ARM:
+            swH_armed = True
+        if condL and swL_armed:
+            sw_st, sw = -1, {"i": i, "cf": 0, "t": tstr}
+            swL_armed = False
+        elif not condL and RE_ARM:
+            swL_armed = True
 
-        # ── GZ SWEEP (strict: close wapas zone ke ANDAR) ──
-        if gw_st == 0:
-            if pH > gzT + pcT and pC < gzT and pC > gzB:
-                gw_st, gw = 1, {"i": i, "cf": 0, "t": tstr}
-            elif pL < gzB - pcB and pC > gzB and pC < gzT:
-                gw_st, gw = -1, {"i": i, "cf": 0, "t": tstr}
+        # ── GZ SWEEP (RE-ARM same rule; strict: close wapas zone ke ANDAR) ──
+        gcondH = pH > gzT + pcT and pC < gzT and pC > gzB
+        gcondL = pL < gzB - pcB and pC > gzB and pC < gzT
+        if gcondH and gwH_armed:
+            gw_st, gw = 1, {"i": i, "cf": 0, "t": tstr}
+            gwH_armed = False
+        elif not gcondH and RE_ARM:
+            gwH_armed = True
+        if gcondL and gwL_armed:
+            gw_st, gw = -1, {"i": i, "cf": 0, "t": tstr}
+            gwL_armed = False
+        elif not gcondL and RE_ARM:
+            gwL_armed = True
 
-        # ── TRAP (Pine same order): pehle lastBreak update, phir counts ──
+        # ── TRAP (RE-ARM: naya break + naya N-candle reclaim => NAYA trap) ──
         if pC < kL:
             last_break = -1
         elif pC > kH:
             last_break = 1
         above_cnt = above_cnt + 1 if (last_break == -1 and pC > kL) else 0
         below_cnt = below_cnt + 1 if (last_break == 1 and pC < kH) else 0
-        if above_cnt == TRAP_CONF_N and trap_up_t is None:
+        if above_cnt == TRAP_CONF_N and (RE_ARM or trap_up_t is None):
             trap_up_t = tstr   # bullish trap: breakdown fail + reclaim held
-        if below_cnt == TRAP_CONF_N and trap_dn_t is None:
+        if below_cnt == TRAP_CONF_N and (RE_ARM or trap_dn_t is None):
             trap_dn_t = tstr   # bearish trap: breakout fail + reject held
 
     # ── sirf ✓ CONFIRMED events return karo ──
@@ -391,7 +411,8 @@ def main() -> int:
 
     for name, tk in SYMBOLS.items():
         try:
-            df = data[tk] if len(tickers) > 1 else data
+            # group_by="ticker" par 1 symbol me bhi columns nested ho sakte hain
+            df = data[tk] if isinstance(data.columns, pd.MultiIndex) else data
             if df is None or df.empty:
                 continue
             df = df.copy()
@@ -399,6 +420,10 @@ def main() -> int:
             if df.index.tz is None:
                 df.index = df.index.tz_localize("UTC")
             df.index = df.index.tz_convert(IST)
+            # HOLIDAY GUARD: weekday-chhutti par Yahoo pichhle din ka data deta
+            # hai — bina is check ke purane signals dobara alert ho jate.
+            if not force and len(df) and df.index[-1].date() != ts.date():
+                continue
             events = analyze_symbol(df)
         except Exception as e:
             print(f"[WARN] {name}: {e}")
